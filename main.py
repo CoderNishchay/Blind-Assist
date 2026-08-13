@@ -267,4 +267,3 @@ class BlindAssistApp:
 if __name__ == "__main__":
     app = BlindAssistApp(CFG)
     app.run()
-11
