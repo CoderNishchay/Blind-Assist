@@ -18,7 +18,6 @@ Press 'q' in the video window (or Ctrl+C in the terminal) to stop.
 """
 
 import logging
-import math
 import threading
 import time
 from collections import Counter, deque
@@ -48,28 +47,6 @@ class Config:
     frame_height: int = 720
     warmup_frames: int = 15
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    enable_distance_filter: bool = True
-    max_distance_meters: float = 3.0   # ignore anything estimated farther than this
-    camera_fov_degrees: float = 60.0   # typical laptop/webcam horizontal FOV — adjust if distances look off
-
-
-# Approximate real-world height (meters) per COCO class, used for distance estimation.
-# Unlisted classes fall back to DEFAULT_HEIGHT_M — a rough guess, so distance for
-# those will be less accurate.
-KNOWN_HEIGHTS_M = {
-    "person": 1.7, "bicycle": 1.0, "car": 1.5, "motorcycle": 1.1, "bus": 3.2,
-    "truck": 3.0, "bench": 0.9, "chair": 0.9, "couch": 0.8, "bed": 0.6,
-    "dining table": 0.75, "tv": 0.5, "laptop": 0.25, "bottle": 0.25,
-    "wine glass": 0.2, "cup": 0.1, "fork": 0.18, "knife": 0.2, "spoon": 0.16,
-    "bowl": 0.1, "banana": 0.18, "apple": 0.08, "backpack": 0.45,
-    "umbrella": 0.9, "handbag": 0.3, "suitcase": 0.6, "refrigerator": 1.7,
-    "microwave": 0.3, "oven": 0.6, "sink": 0.2, "toilet": 0.4,
-    "book": 0.25, "clock": 0.3, "vase": 0.3, "cell phone": 0.15,
-    "keyboard": 0.03, "mouse": 0.04, "remote": 0.15, "scissors": 0.2,
-    "toothbrush": 0.18, "hair drier": 0.25, "dog": 0.5, "cat": 0.3,
-    "horse": 1.6, "sheep": 0.9, "cow": 1.4,
-}
-DEFAULT_HEIGHT_M = 0.3
 
 
 CFG = Config()
@@ -102,8 +79,6 @@ class BlindAssistCamera:
     def __init__(self, config: Config):
         self.cfg = config
         self.cap: Optional[cv2.VideoCapture] = None
-        self.actual_width: int = config.frame_width
-        self.actual_height: int = config.frame_height
 
     def start(self) -> None:
         # CAP_DSHOW avoids OpenCV silently ignoring resolution requests on Windows;
@@ -123,8 +98,6 @@ class BlindAssistCamera:
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.actual_width = actual_w
-        self.actual_height = actual_h
         print(f"Camera resolution: requested {self.cfg.frame_width}x{self.cfg.frame_height}, "
               f"actual {actual_w}x{actual_h}")
 
@@ -158,16 +131,6 @@ class BlindAssistApp:
         self.model = YOLO(config.model_path)
         self.recent_passes: deque = deque(maxlen=config.vote_window)
         self.last_announced_at: dict = {}
-        self.focal_length_px: float = 0.0  # set once the camera's actual resolution is known
-
-    def _estimate_distance_m(self, label: str, box_height_px: float) -> float:
-        """Rough monocular distance estimate: (real-world height * focal length) / pixel height.
-        Accuracy depends on the FOV assumption and the per-class height table — treat this
-        as 'closer/farther', not a precise measurement."""
-        if box_height_px <= 0 or self.focal_length_px <= 0:
-            return float("inf")
-        real_height_m = KNOWN_HEIGHTS_M.get(label, DEFAULT_HEIGHT_M)
-        return (real_height_m * self.focal_length_px) / box_height_px
 
     def _detect_objects(self, frame: np.ndarray) -> Set[str]:
         results = self.model(
@@ -178,19 +141,7 @@ class BlindAssistApp:
             verbose=False,
         )
         names = self.model.names
-        detected: Set[str] = set()
-        for r in results:
-            for box in r.boxes:
-                label = names[int(box.cls[0])]
-                if not self.cfg.enable_distance_filter:
-                    detected.add(label)
-                    continue
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                box_height_px = y2 - y1
-                distance_m = self._estimate_distance_m(label, box_height_px)
-                if distance_m <= self.cfg.max_distance_meters:
-                    detected.add(label)
-        return detected
+        return {names[int(box.cls[0])] for r in results for box in r.boxes}
 
     def _stable_objects(self, current: Set[str]) -> Set[str]:
         """Only trust a label if it showed up in >= vote_threshold of the last
@@ -217,14 +168,6 @@ class BlindAssistApp:
 
     def run(self) -> None:
         self.camera.start()
-        if self.cfg.enable_distance_filter:
-            self.focal_length_px = self.camera.actual_width / (
-                2 * math.tan(math.radians(self.cfg.camera_fov_degrees / 2))
-            )
-            print(f"Distance filter ON: max {self.cfg.max_distance_meters}m "
-                  f"(focal length ~{self.focal_length_px:.0f}px, assumes "
-                  f"{self.cfg.camera_fov_degrees}° FOV — tune camera_fov_degrees if "
-                  f"distances look consistently too short/long)")
         print("BlindAssist running. Press 'q' in the video window to stop.")
         last_detection_time = 0.0
         try:
