@@ -1,0 +1,6 @@
+ultralytics
+opencv-python
+numpy
+Pillow
+pyttsx3
+face-recognition
