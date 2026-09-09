@@ -1,22 +1,3 @@
-"""
-BlindAssist — Real-Time Object Detection Voice Assistant (Local / VS Code)
-============================================================================
-Local counterpart of the Colab notebook version. Reads directly from your
-webcam via OpenCV and speaks using offline TTS (pyttsx3) instead of the
-browser's Web Speech API — no browser/Colab bridge involved.
-
-SETUP (venv already created):
-    pip install ultralytics opencv-python pyttsx3
-
-    # Windows note: pyttsx3 uses SAPI5, works out of the box.
-    # Linux note: pyttsx3 needs espeak installed: sudo apt install espeak
-
-RUN:
-    python main.py
-
-Press 'q' in the video window (or Ctrl+C in the terminal) to stop.
-"""
-
 import logging
 import threading
 import time
@@ -29,6 +10,7 @@ import numpy as np
 import pyttsx3
 import torch
 from ultralytics import YOLO
+from deepface import DeepFace
 
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
@@ -38,9 +20,10 @@ class Config:
     model_path: str = "yolov8m.pt"
     confidence: float = 0.5
     inference_size: int = 640
-    detection_interval: float = 0.8   # seconds between capture+detect cycles
-    vote_window: int = 3              # detection passes considered per vote
-    vote_threshold: int = 2           # label must appear in >= this many of the last `vote_window` passes
+    detection_interval: float = 1.0
+    emotion_interval: float = 4.0
+    vote_window: int = 3
+    vote_threshold: int = 2
     camera_index: int = 0
     frame_width: int = 680
     frame_height: int = 480
@@ -52,17 +35,17 @@ CFG = Config()
 
 
 class SpeechEngine:
-    """Non-blocking wrapper around pyttsx3 so speaking never stalls the detection loop."""
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
     def speak(self, text: str) -> None:
-        threading.Thread(target=self._speak_sync, args=(text,), daemon=True).start()
+        threading.Thread(
+            target=self._speak_sync,
+            args=(text,),
+            daemon=True
+        ).start()
 
     def _speak_sync(self, text: str) -> None:
-        # pyttsx3 engines aren't thread-safe to share, so create one per call
-        # and serialize with a lock to avoid overlapping/garbled speech.
         with self._lock:
             engine = pyttsx3.init()
             engine.setProperty("rate", 170)
@@ -73,78 +56,117 @@ class SpeechEngine:
 
 
 class BlindAssistCamera:
-    """Wraps a local webcam via OpenCV."""
 
     def __init__(self, config: Config):
         self.cfg = config
         self.cap: Optional[cv2.VideoCapture] = None
 
     def start(self) -> None:
-        # CAP_DSHOW avoids OpenCV silently ignoring resolution requests on Windows;
-        # harmless no-op on other platforms since we fall back if it fails to open.
-        self.cap = cv2.VideoCapture(self.cfg.camera_index, cv2.CAP_DSHOW)
+        self.cap = cv2.VideoCapture(
+            self.cfg.camera_index,
+            cv2.CAP_DSHOW
+        )
+
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(self.cfg.camera_index)
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.frame_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.frame_height)
-        # Keep only the newest frame in OpenCV's internal buffer. Without this,
-        # any time our loop falls behind the camera's native frame rate (which
-        # it will, since YOLO inference takes longer than one frame interval),
-        # the buffer fills with stale frames and the feed looks laggy/delayed.
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            self.cfg.frame_width
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            self.cfg.frame_height
+        )
+
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self.cap.isOpened():
-            raise RuntimeError(
-                f"Could not open webcam at index {self.cfg.camera_index}. "
-                "Check that it's connected and not in use by another app."
-            )
+            raise RuntimeError("Could not open webcam.")
 
-        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera resolution: requested {self.cfg.frame_width}x{self.cfg.frame_height}, "
-              f"actual {actual_w}x{actual_h}")
+        actual_w = int(
+            self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        )
 
-        # Let auto-exposure/auto-focus settle before detection starts on real frames.
+        actual_h = int(
+            self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        )
+
+        print(f"Camera resolution: {actual_w}x{actual_h}")
+
         for _ in range(self.cfg.warmup_frames):
             self.cap.read()
 
     def is_running(self) -> bool:
-        return self.cap is not None and self.cap.isOpened()
+        return (
+            self.cap is not None
+            and self.cap.isOpened()
+        )
 
     def get_frame(self) -> Optional[np.ndarray]:
         if not self.is_running():
             return None
+
         ok, frame = self.cap.read()
+
         return frame if ok else None
 
     def stop(self) -> None:
         if self.cap is not None:
             self.cap.release()
+
         cv2.destroyAllWindows()
 
 
 class BlindAssistApp:
-    """Detect -> vote for stability -> draw boxes -> announce arrivals/returns."""
 
     def __init__(self, config: Config):
+
         self.cfg = config
+
         self.camera = BlindAssistCamera(config)
         self.speech = SpeechEngine()
-        print(f"Loading {config.model_path} on {config.device}...")
+
+        print(
+            f"Loading {config.model_path} "
+            f"on {config.device}..."
+        )
+
         self.model = YOLO(config.model_path)
-        self.recent_passes: deque = deque(maxlen=config.vote_window)
-        # Tracks what was present as of the *last* detection pass, so we can
-        # tell arrivals/returns and departures apart from continuous presence.
+
+        self.recent_passes: deque = deque(
+            maxlen=config.vote_window
+        )
+
         self.currently_present: Set[str] = set()
 
         self._latest_frame: Optional[np.ndarray] = None
-        self._latest_boxes: List[Tuple[int, int, int, int, str, float]] = []
+
+        self._latest_boxes: List[
+            Tuple[int, int, int, int, str, float]
+        ] = []
+
         self._frame_lock = threading.Lock()
         self._box_lock = threading.Lock()
+
         self._detector_stop = threading.Event()
 
-    def _detect_objects(self, frame: np.ndarray) -> List[Tuple[int, int, int, int, str, float]]:
+        # Face announcement control
+        self.last_face_names: Set[str] = set()
+        self.last_face_time = 0.0
+
+        # Emotion announcement control
+        self.last_emotions: dict = {}
+        self.last_emotion_analysis = 0.0
+
+    def _detect_objects(
+        self,
+        frame: np.ndarray
+    ) -> List[
+        Tuple[int, int, int, int, str, float]
+    ]:
+
         results = self.model(
             frame,
             conf=self.cfg.confidence,
@@ -152,64 +174,332 @@ class BlindAssistApp:
             device=self.cfg.device,
             verbose=False,
         )
+
         names = self.model.names
         boxes = []
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                label = names[int(box.cls[0])]
-                conf = float(box.conf[0])
-                boxes.append((x1, y1, x2, y2, label, conf))
+
+        for result in results:
+
+            for box in result.boxes:
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    box.xyxy[0]
+                )
+
+                label = names[
+                    int(box.cls[0])
+                ]
+
+                confidence = float(
+                    box.conf[0]
+                )
+
+                boxes.append(
+                    (
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        label,
+                        confidence
+                    )
+                )
+
         return boxes
 
-    def _stable_objects(self, current: Set[str]) -> Set[str]:
-        """Only trust a label if it showed up in >= vote_threshold of the last
-        vote_window detection passes. This absorbs single-frame flicker between
-        similar-looking classes (e.g. bottle/banana/cup on an unfamiliar object)."""
-        self.recent_passes.append(current)
-        votes = Counter(label for pass_labels in self.recent_passes for label in pass_labels)
-        return {label for label, count in votes.items() if count >= self.cfg.vote_threshold}
+    def _detect_faces(
+        self,
+        frame: np.ndarray
+    ) -> List[np.ndarray]:
 
-    def _announce_new_objects(self, stable_now: Set[str]) -> None:
-        # Anything that wasn't present last pass but is now is either brand
-        # new or has just walked back into frame.
-        newly_arrived = stable_now - self.currently_present
-        # Anything that was present last pass but isn't now has left frame.
-        departed = self.currently_present - stable_now
+        faces = []
+
+        try:
+
+            results = DeepFace.extract_faces(
+                img_path=frame,
+                detector_backend="opencv",
+                enforce_detection=False,
+                align=True
+            )
+
+            for result in results:
+
+                face = result.get("face")
+
+                if face is None:
+                    continue
+
+                face = np.asarray(face)
+
+                if face.size == 0:
+                    continue
+
+                # DeepFace may return RGB normalized image.
+                # Convert to uint8 BGR for further processing.
+                if face.dtype != np.uint8:
+                    face = np.clip(
+                        face * 255.0,
+                        0,
+                        255
+                    ).astype(np.uint8)
+
+                face = cv2.cvtColor(
+                    face,
+                    cv2.COLOR_RGB2BGR
+                )
+
+                faces.append(face)
+
+        except Exception:
+            pass
+
+        return faces
+
+    def _recognize_face(
+        self,
+        face: np.ndarray
+    ) -> str:
+
+        try:
+
+            results = DeepFace.find(
+                img_path=face,
+                db_path="known_faces",
+                model_name="VGG-Face",
+                detector_backend="opencv",
+                enforce_detection=False,
+                silent=True
+            )
+
+            if (
+                len(results) > 0
+                and len(results[0]) > 0
+            ):
+
+                identity = str(
+                    results[0].iloc[0]["identity"]
+                )
+
+                if "Md Eliyas" in identity:
+                    return "Md Eliyas"
+
+        except Exception:
+            pass
+
+        return "Unknown person"
+
+    def _detect_emotion(
+        self,
+        face: np.ndarray
+    ) -> Optional[str]:
+
+        try:
+
+            result = DeepFace.analyze(
+                img_path=face,
+                actions=["emotion"],
+                detector_backend="opencv",
+                enforce_detection=False,
+                silent=True
+            )
+
+            if isinstance(result, list):
+
+                if len(result) == 0:
+                    return None
+
+                result = result[0]
+
+            emotion = result.get(
+                "dominant_emotion"
+            )
+
+            if emotion:
+                return str(
+                    emotion
+                ).capitalize()
+
+        except Exception:
+            pass
+
+        return None
+
+    def _announce_face(
+        self,
+        names: List[str]
+    ) -> None:
+
+        if not names:
+            return
+
+        current_time = time.time()
+
+        current_names = set(names)
+
+        if (
+            current_names != self.last_face_names
+            or current_time - self.last_face_time > 5
+        ):
+
+            for name in names:
+
+                message = f"{name} detected"
+
+                print(f"[FACE] {message}")
+
+                self.speech.speak(message)
+
+            self.last_face_names = current_names
+            self.last_face_time = current_time
+
+    def _announce_emotion(
+        self,
+        name: str,
+        emotion: Optional[str]
+    ) -> None:
+
+        if emotion is None:
+            return
+
+        current_time = time.time()
+
+        last_emotion = self.last_emotions.get(
+            name,
+            ""
+        )
+
+        if (
+            emotion != last_emotion
+            or current_time - self.last_emotion_analysis
+            > self.cfg.emotion_interval
+        ):
+
+            message = (
+                f"{name} appears to be {emotion}"
+            )
+
+            print(
+                f"[EMOTION] {message}"
+            )
+
+            self.speech.speak(message)
+
+            self.last_emotions[name] = emotion
+
+    def _stable_objects(
+        self,
+        current: Set[str]
+    ) -> Set[str]:
+
+        self.recent_passes.append(current)
+
+        votes = Counter(
+            label
+            for pass_labels in self.recent_passes
+            for label in pass_labels
+        )
+
+        return {
+            label
+            for label, count in votes.items()
+            if count >= self.cfg.vote_threshold
+        }
+
+    def _announce_new_objects(
+        self,
+        stable_now: Set[str]
+    ) -> None:
+
+        newly_arrived = (
+            stable_now
+            - self.currently_present
+        )
+
+        departed = (
+            self.currently_present
+            - stable_now
+        )
 
         if newly_arrived:
+
             labels = sorted(newly_arrived)
-            suffix = " detected" if len(labels) == 1 else "s detected"
-            message = ", ".join(labels) + suffix
-            print(f"[SPEAK] {message}")
-            self.speech.speak(message)
+
+            for label in labels:
+
+                message = f"{label} detected"
+
+                print(
+                    f"[OBJECT] {message}"
+                )
+
+                self.speech.speak(message)
 
         if departed:
+
             labels = sorted(departed)
-            suffix = " gone" if len(labels) == 1 else "s gone"
-            message = ", ".join(labels) + suffix
-            print(f"[SPEAK] {message}")
-            self.speech.speak(message)
+
+            for label in labels:
+
+                message = f"{label} gone"
+
+                print(
+                    f"[OBJECT] {message}"
+                )
+
+                self.speech.speak(message)
 
         self.currently_present = stable_now
 
     @staticmethod
-    def _draw_boxes(frame: np.ndarray, boxes: List[Tuple[int, int, int, int, str, float]]) -> np.ndarray:
-        for x1, y1, x2, y2, label, conf in boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            text = f"{label} {conf:.2f}"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 255, 0), -1)
-            cv2.putText(frame, text, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    def _draw_boxes(
+        frame: np.ndarray,
+        boxes: List[
+            Tuple[int, int, int, int, str, float]
+        ]
+    ) -> np.ndarray:
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2,
+            label,
+            confidence
+        ) in boxes:
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+            text = (
+                f"{label} "
+                f"{confidence:.2f}"
+            )
+
+            cv2.putText(
+                frame,
+                text,
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
         return frame
 
     def _detection_worker(self) -> None:
-        """Runs on its own thread so slow YOLO inference never blocks frame
-        capture/display. Always grabs whatever the latest frame is, runs
-        detection on it, then immediately looks for the newest frame again —
-        effectively skipping any frames that arrived while it was busy."""
+
         last_detection_time = 0.0
+
         while not self._detector_stop.is_set():
+
             with self._frame_lock:
                 frame = self._latest_frame
 
@@ -218,14 +508,87 @@ class BlindAssistApp:
                 continue
 
             now = time.time()
-            if now - last_detection_time < self.cfg.detection_interval:
+
+            if (
+                now - last_detection_time
+                < self.cfg.detection_interval
+            ):
                 time.sleep(0.01)
                 continue
 
+            # --------------------------------
+            # YOLO OBJECT DETECTION
+            # --------------------------------
+
             boxes = self._detect_objects(frame)
-            current_objects = {label for *_, label, _ in boxes}
-            stable_now = self._stable_objects(current_objects)
-            self._announce_new_objects(stable_now)
+
+            current_objects = {
+                label
+                for *_, label, _ in boxes
+            }
+
+            stable_now = self._stable_objects(
+                current_objects
+            )
+
+            self._announce_new_objects(
+                stable_now
+            )
+
+            # --------------------------------
+            # FACE DETECTION
+            # --------------------------------
+
+            faces = self._detect_faces(frame)
+
+            detected_names = []
+
+            for face in faces:
+
+                # --------------------------------
+                # FACE RECOGNITION
+                # --------------------------------
+
+                face_name = self._recognize_face(
+                    face
+                )
+
+                detected_names.append(
+                    face_name
+                )
+
+            # Announce known / unknown people
+            self._announce_face(
+                detected_names
+            )
+
+            # --------------------------------
+            # EMOTION DETECTION
+            # --------------------------------
+
+            if (
+                faces
+                and now - self.last_emotion_analysis
+                >= self.cfg.emotion_interval
+            ):
+
+                for index, face in enumerate(faces):
+
+                    if index < len(detected_names):
+                        face_name = detected_names[index]
+                    else:
+                        face_name = "Unknown person"
+
+                    emotion = self._detect_emotion(
+                        face
+                    )
+
+                    self._announce_emotion(
+                        face_name,
+                        emotion
+                    )
+
+                self.last_emotion_analysis = time.time()
 
             with self._box_lock:
                 self._latest_boxes = boxes
@@ -233,15 +596,28 @@ class BlindAssistApp:
             last_detection_time = time.time()
 
     def run(self) -> None:
-        self.camera.start()
-        print("BlindAssist running. Press 'q' in the video window to stop.")
 
-        detector_thread = threading.Thread(target=self._detection_worker, daemon=True)
+        self.camera.start()
+
+        print("BlindAssist running.")
+
+        print(
+            "Press 'q' in the camera window to stop."
+        )
+
+        detector_thread = threading.Thread(
+            target=self._detection_worker,
+            daemon=True
+        )
+
         detector_thread.start()
 
         try:
+
             while self.camera.is_running():
+
                 frame = self.camera.get_frame()
+
                 if frame is None:
                     continue
 
@@ -251,19 +627,45 @@ class BlindAssistApp:
                 with self._box_lock:
                     boxes = self._latest_boxes
 
-                display_frame = self._draw_boxes(frame.copy(), boxes)
-                cv2.imshow("BlindAssist", display_frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                display_frame = self._draw_boxes(
+                    frame.copy(),
+                    boxes
+                )
+
+                cv2.imshow(
+                    "BlindAssist",
+                    display_frame
+                )
+
+                if (
+                    cv2.waitKey(1) & 0xFF
+                    == ord("q")
+                ):
                     break
+
         except KeyboardInterrupt:
-            print("Interrupted by user.")
+
+            print(
+                "Interrupted by user."
+            )
+
         finally:
+
             self._detector_stop.set()
-            detector_thread.join(timeout=2.0)
+
+            detector_thread.join(
+                timeout=2.0
+            )
+
             self.camera.stop()
-            print("BlindAssist stopped.")
+
+            print(
+                "BlindAssist stopped."
+            )
 
 
 if __name__ == "__main__":
+
     app = BlindAssistApp(CFG)
+
     app.run()
